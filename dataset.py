@@ -156,13 +156,26 @@ def resample_by_distance(path_points, spacing_m):
     Walk the dense OSRM polyline and emit a new point every `spacing_m` meters
     of cumulative arc length, interpolating linearly between the original
     vertices when a target distance falls between two of them.
+
+    Returns a list of (lat, lon, arc_length_from_prev_m) tuples. The third
+    value is the TRUE road-following distance from the previous resampled
+    point -- NOT the straight-line chord between the two resampled points.
+
+    This distinction matters a lot on switchback roads: on a tight hairpin,
+    the chord between two points 300m apart *along the road* can be much
+    shorter than 300m, because the road doubles back on itself within that
+    span. If downstream code recomputes distance via haversine on the
+    resampled points instead of using this arc length, it silently
+    reintroduces the exact chord-cutting bug this resampling step was
+    built to fix -- just one level downstream.
     """
     if len(path_points) < 2:
-        return path_points
+        return [(path_points[0][0], path_points[0][1], 0.0)]
 
-    resampled = [path_points[0]]
+    resampled = [(path_points[0][0], path_points[0][1], 0.0)]
     next_target = spacing_m
     cum_dist = 0.0
+    last_emitted_at = 0.0  # cumulative arc length at the last emitted point
 
     for i in range(1, len(path_points)):
         lat1, lon1 = path_points[i - 1]
@@ -176,13 +189,17 @@ def resample_by_distance(path_points, spacing_m):
             frac = (next_target - cum_dist) / seg_len
             lat = lat1 + frac * (lat2 - lat1)
             lon = lon1 + frac * (lon2 - lon1)
-            resampled.append((lat, lon))
+            arc_step = next_target - last_emitted_at
+            resampled.append((lat, lon, arc_step))
+            last_emitted_at = next_target
             next_target += spacing_m
 
         cum_dist += seg_len
 
-    if resampled[-1] != path_points[-1]:
-        resampled.append(path_points[-1])
+    total_arc = cum_dist
+    if (resampled[-1][0], resampled[-1][1]) != path_points[-1]:
+        final_step = total_arc - last_emitted_at
+        resampled.append((path_points[-1][0], path_points[-1][1], final_step))
 
     return resampled
 
@@ -232,6 +249,14 @@ def smooth_elevations(elevations, window=SMOOTHING_WINDOW):
 # ---------------------------------------------------------------------------
 
 def build_route_geometry(route_id, points, elevations):
+    """
+    points: list of (lat, lon, arc_length_from_prev_m) from resample_by_distance.
+    segment_length_m is taken directly from that arc length -- it is NOT
+    recomputed as a straight-line chord between (lat, lon) pairs. On a
+    switchback road, the chord between two points 300m apart along the
+    road can be much shorter than 300m, which would silently undercount
+    total distance again (the same bug the resampling step exists to fix).
+    """
     rows = []
     cum_distance_km = 0.0
     cum_gain_m = 0.0
@@ -239,15 +264,14 @@ def build_route_geometry(route_id, points, elevations):
 
     smoothed_elevations = smooth_elevations(elevations)
 
-    for i, ((lat, lon), elev, smoothed_elev) in enumerate(zip(points, elevations, smoothed_elevations)):
+    for i, ((lat, lon, arc_len_m), elev, smoothed_elev) in enumerate(zip(points, elevations, smoothed_elevations)):
         if i == 0:
             segment_length_m = 0.0
             delta_elevation_m = 0.0
             gradient_percent = 0.0
         else:
-            prev_lat, prev_lon = points[i - 1]
             prev_smoothed_elev = smoothed_elevations[i - 1]
-            segment_length_m = haversine_m(prev_lat, prev_lon, lat, lon)
+            segment_length_m = arc_len_m
             raw_delta = smoothed_elev - prev_smoothed_elev
 
             delta_elevation_m = raw_delta if abs(raw_delta) > NOISE_FLOOR_M else 0.0
@@ -382,7 +406,7 @@ def main():
         print(f"  resampled to {len(resampled_points)} points")
 
         print("  fetching elevations from Open Topo Data...")
-        elevations = get_elevations(resampled_points)
+        elevations = get_elevations([(lat, lon) for lat, lon, _ in resampled_points])
 
         geometry_rows = build_route_geometry(route_id, resampled_points, elevations)
         all_geometry_rows.extend(geometry_rows)
