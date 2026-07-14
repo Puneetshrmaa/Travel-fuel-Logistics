@@ -93,7 +93,11 @@ VEHICLE = {
     "Cd_A": 0.6,                  # drag coefficient * frontal area (m^2)
     "thermal_efficiency": 0.27,   # ICE thermal efficiency
     "fuel_calorific_value_MJ_per_L": 32.0,  # petrol, per liter (~44 MJ/kg * ~0.74 kg/L)
-    "flat_speed_kmh": 40.0,       # placeholder until gradient-limited speed model is added
+    "flat_speed_kmh": 40.0,       # kept only as the OLD placeholder, for comparison
+    "rated_power_W": 18000,       # ~24 PS, typical loaded touring bike (e.g. RE Himalayan class)
+    "sustained_power_fraction": 0.45,  # realistic continuous climbing output, not full throttle
+    "min_speed_kmh": 8.0,         # switchback/hairpin floor -- can't solve to a crawl below this
+    "max_speed_kmh": 65.0,        # mountain-highway safety cap even where power would allow more
 }
 
 G = 9.81
@@ -311,6 +315,76 @@ def air_density_ratio(altitude_m):
     return math.exp(-altitude_m / 8500.0)
 
 
+# ---------------------------------------------------------------------------
+# Step 5b — gradient-limited speed: power available vs. power required
+# ---------------------------------------------------------------------------
+
+def max_sustainable_speed_kmh(gradient_percent, altitude_m, vehicle):
+    """
+    Solve for the max speed v (m/s) where:
+        P_required(v) = m*g*(sin(theta) + Crr*cos(theta))*v + 0.5*rho(h)*Cd_A*v^3
+    equals the altitude-derated sustained engine power. P_required(v) is
+    monotonically increasing in v, so bisection is a simple, robust solve --
+    no need for a closed-form cubic root.
+
+    Both engine power AND air density drop with altitude (same physical
+    cause as the aero term in physics_baseline: less oxygen per intake
+    stroke), so both sides of the equation are derated together.
+    """
+    theta = math.atan(gradient_percent / 100.0)
+    m = vehicle["vehicle_mass_kg"]
+    Crr = vehicle["Crr"]
+    Cd_A = vehicle["Cd_A"]
+
+    rho_ratio = air_density_ratio(altitude_m)
+    rho = 1.225 * rho_ratio
+    P_avail_W = vehicle["rated_power_W"] * vehicle["sustained_power_fraction"] * rho_ratio
+
+    def power_required(v):
+        climb_and_roll = m * G * (math.sin(theta) + Crr * math.cos(theta)) * v
+        aero = 0.5 * rho * Cd_A * v ** 3
+        return climb_and_roll + aero
+
+    lo, hi = 0.01, vehicle["max_speed_kmh"] / 3.6
+    if power_required(hi) <= P_avail_W:
+        v = hi
+    else:
+        for _ in range(40):
+            mid = (lo + hi) / 2.0
+            if power_required(mid) <= P_avail_W:
+                lo = mid
+            else:
+                hi = mid
+        v = (lo + hi) / 2.0
+
+    v_kmh = v * 3.6
+    return max(vehicle["min_speed_kmh"], min(v_kmh, vehicle["max_speed_kmh"]))
+
+
+def gradient_limited_time_hr(geometry_rows, vehicle):
+    """
+    Sums segment_length_m / max_sustainable_speed_kmh(...) across the route.
+    Uses each segment's own gradient_percent, and the average of its two
+    endpoint smoothed elevations for the altitude-derating term.
+    Returns (total_time_hr, min_speed_seen_kmh, max_speed_seen_kmh).
+    """
+    total_time_hr = 0.0
+    min_speed = float("inf")
+    max_speed = float("-inf")
+
+    for i, row in enumerate(geometry_rows):
+        if i == 0:
+            continue
+        prev_elev = geometry_rows[i - 1]["elevation_m_smoothed"]
+        mid_altitude_m = (prev_elev + row["elevation_m_smoothed"]) / 2.0
+        speed_kmh = max_sustainable_speed_kmh(row["gradient_percent"], mid_altitude_m, vehicle)
+        min_speed = min(min_speed, speed_kmh)
+        max_speed = max(max_speed, speed_kmh)
+        total_time_hr += (row["segment_length_m"] / 1000.0) / speed_kmh
+
+    return total_time_hr, min_speed, max_speed
+
+
 def physics_baseline(route_id, route_name, geometry_rows, vehicle):
     total_distance_km = geometry_rows[-1]["cum_distance_km"]
     total_gain_m = geometry_rows[-1]["cum_elevation_gain_m"]
@@ -336,7 +410,10 @@ def physics_baseline(route_id, route_name, geometry_rows, vehicle):
 
     fuel_L = E_effective_MJ / (vehicle["thermal_efficiency"] * vehicle["fuel_calorific_value_MJ_per_L"])
 
-    baseline_time_hr = total_distance_km / vehicle["flat_speed_kmh"]
+    flat_time_hr = total_distance_km / vehicle["flat_speed_kmh"]  # old placeholder, kept for comparison
+
+    grad_time_hr, min_speed_kmh, max_speed_kmh = gradient_limited_time_hr(geometry_rows, vehicle)
+    avg_speed_kmh = total_distance_km / grad_time_hr if grad_time_hr > 0 else 0.0
 
     return {
         "route_id": route_id,
@@ -349,7 +426,11 @@ def physics_baseline(route_id, route_name, geometry_rows, vehicle):
         "mean_air_density_ratio": round(rho_ratio, 3),
         "baseline_energy_MJ": round(E_effective_MJ, 1),
         "baseline_fuel_L": round(fuel_L, 2),
-        "baseline_time_hr": round(baseline_time_hr, 1),
+        "flat_speed_time_hr": round(flat_time_hr, 1),
+        "gradient_limited_time_hr": round(grad_time_hr, 1),
+        "gradient_limited_avg_speed_kmh": round(avg_speed_kmh, 1),
+        "gradient_limited_min_speed_kmh": round(min_speed_kmh, 1),
+        "gradient_limited_max_speed_kmh": round(max_speed_kmh, 1),
     }
 
 
@@ -370,8 +451,10 @@ def write_geometry_csv(all_geometry_rows, path):
 def write_baseline_csv(all_baseline_rows, path):
     fieldnames = ["route_id", "route_name", "vehicle_class", "vehicle_mass_kg",
                   "total_distance_km", "total_elevation_gain_m", "max_altitude_m",
-                  "mean_air_density_ratio", "baseline_energy_MJ",
-                  "baseline_fuel_L", "baseline_time_hr"]
+                  "mean_air_density_ratio", "baseline_energy_MJ", "baseline_fuel_L",
+                  "flat_speed_time_hr", "gradient_limited_time_hr",
+                  "gradient_limited_avg_speed_kmh", "gradient_limited_min_speed_kmh",
+                  "gradient_limited_max_speed_kmh"]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -425,7 +508,10 @@ def main():
                 print(f"  distance check OK (expected {lo}-{hi} km)")
         print(f"  total_elevation_gain_m = {baseline_row['total_elevation_gain_m']}")
         print(f"  baseline_fuel_L = {baseline_row['baseline_fuel_L']}")
-        print(f"  baseline_time_hr (placeholder, flat-speed) = {baseline_row['baseline_time_hr']}")
+        print(f"  flat_speed_time_hr (old placeholder, {VEHICLE['flat_speed_kmh']} km/h flat) = {baseline_row['flat_speed_time_hr']}")
+        print(f"  gradient_limited_time_hr = {baseline_row['gradient_limited_time_hr']}  "
+              f"(avg {baseline_row['gradient_limited_avg_speed_kmh']} km/h, "
+              f"range {baseline_row['gradient_limited_min_speed_kmh']}-{baseline_row['gradient_limited_max_speed_kmh']} km/h)")
         print()
 
     write_geometry_csv(all_geometry_rows, "all_routes_geometry.csv")

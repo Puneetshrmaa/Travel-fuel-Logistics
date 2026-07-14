@@ -1,2 +1,2 @@
-route_id,route_name,vehicle_class,vehicle_mass_kg,total_distance_km,total_elevation_gain_m,max_altitude_m,mean_air_density_ratio,baseline_energy_MJ,baseline_fuel_L,baseline_time_hr
-manali_leh,Manali to Leh,loaded_touring_bike,220,425.4,7695.4,5316.4,0.624,50.8,5.88,10.6
+route_id,route_name,vehicle_class,vehicle_mass_kg,total_distance_km,total_elevation_gain_m,max_altitude_m,mean_air_density_ratio,baseline_energy_MJ,baseline_fuel_L,flat_speed_time_hr,gradient_limited_time_hr,gradient_limited_avg_speed_kmh,gradient_limited_min_speed_kmh,gradient_limited_max_speed_kmh
+manali_leh,Manali to Leh,loaded_touring_bike,220,425.4,7695.4,5316.4,0.624,50.8,5.88,10.6,6.7,63.8,19.0,65.0
